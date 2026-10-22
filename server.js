@@ -1,6 +1,6 @@
 const http = require('node:http');
 
-const CODES = { SAVE10: 0.1, SAVE20: 0.2 };
+const CODES = { SAVE10: 0.1, SAVE20: 0.2, SAVE30: 0.3 };
 
 function calculateDiscount(price, code) {
   const rate = Object.hasOwn(CODES, code) ? CODES[code] : 0;
@@ -31,6 +31,7 @@ function createServer() {
         app: 'orders-api',
         env: process.env.APP_ENV || 'local',
         version: process.env.APP_VERSION || 'dev',
+        codes: Object.keys(CODES),
       });
     }
     return send(404, { error: 'not found' });
