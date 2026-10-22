@@ -1,6 +1,6 @@
 const http = require('node:http');
 
-const CODES = { SAVE10: 0.9, SAVE20: 0.2 };
+const CODES = { SAVE10: 0.1, SAVE20: 0.2 };
 
 function calculateDiscount(price, code) {
   const rate = Object.hasOwn(CODES, code) ? CODES[code] : 0;
