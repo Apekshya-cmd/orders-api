@@ -1,0 +1,108 @@
+name: rollback-drill
+
+# Practise a production-style rollback end to end in ONE job.
+# deploy.yml creates a fresh kind cluster every run, so Helm history never
+# survives between runs. This drill keeps one cluster alive for the whole story:
+# good release -> bad release -> incident -> rollback -> verify.
+
+on:
+  workflow_dispatch:
+    inputs:
+      good_sha:
+        description: "Full commit SHA of an OLDER release that worked (image already in GHCR)"
+        required: true
+      bad_sha:
+        description: "Full commit SHA of a NEWER release to treat as the bad one"
+        required: true
+      method:
+        description: "How to roll back"
+        type: choice
+        options: [redeploy-good-sha, helm-rollback]
+        default: redeploy-good-sha
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  drill:
+    runs-on: ubuntu-latest
+    env:
+      NS: drill
+      RELEASE: orders-api
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out image name (must be lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Create a kind cluster for the drill
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: drill
+
+      - name: Pull both images from GHCR and load them into the cluster
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          for TAG in "${{ inputs.good_sha }}" "${{ inputs.bad_sha }}"; do
+            docker pull "$IMAGE:$TAG"
+            kind load docker-image "$IMAGE:$TAG" --name drill
+          done
+
+      - name: "1. Deploy the GOOD release"
+        run: |
+          helm upgrade --install "$RELEASE" ./chart -n "$NS" --create-namespace \
+            -f chart/values-dev.yaml \
+            --set image.repository="$IMAGE" \
+            --set image.tag="${{ inputs.good_sha }}" \
+            --atomic --timeout 2m
+
+      - name: "2. Deploy the BAD release (it passes probes, so --atomic does not save us)"
+        run: |
+          helm upgrade --install "$RELEASE" ./chart -n "$NS" \
+            -f chart/values-dev.yaml \
+            --set image.repository="$IMAGE" \
+            --set image.tag="${{ inputs.bad_sha }}" \
+            --atomic --timeout 2m
+
+      - name: "3. Incident: what is running right now?"
+        run: |
+          helm history "$RELEASE" -n "$NS"
+          echo "Running image:"
+          kubectl -n "$NS" get deploy "$RELEASE" -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+
+      - name: "4a. Roll back: find the last good SHA and redeploy it"
+        if: inputs.method == 'redeploy-good-sha'
+        run: |
+          PREV=$(helm history "$RELEASE" -n "$NS" -o json \
+            | jq -r '[.[] | select(.status=="superseded")] | last | .revision')
+          GOOD=$(helm get values "$RELEASE" -n "$NS" --revision "$PREV" -o json \
+            | jq -r '.image.tag')
+          echo "Last good revision: $PREV  ->  SHA: $GOOD"
+          helm upgrade --install "$RELEASE" ./chart -n "$NS" \
+            -f chart/values-dev.yaml \
+            --set image.repository="$IMAGE" \
+            --set image.tag="$GOOD" \
+            --atomic --timeout 2m
+
+      - name: "4b. Roll back: helm rollback to the previous revision"
+        if: inputs.method == 'helm-rollback'
+        run: helm rollback "$RELEASE" -n "$NS" --wait --timeout 2m
+
+      - name: "5. Verify the good version is back"
+        run: |
+          helm history "$RELEASE" -n "$NS"
+          RUNNING=$(kubectl -n "$NS" get deploy "$RELEASE" -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "Running image: $RUNNING"
+          kubectl -n "$NS" port-forward "svc/$RELEASE" 8080:80 &
+          sleep 5
+          echo "App says:"; curl -fsS http://localhost:8080/; echo
+          if [[ "$RUNNING" == *":${{ inputs.good_sha }}" ]]; then
+            echo "PASS: rolled back to the good release"
+          else
+            echo "FAIL: still not on the good release"; exit 1
+          fi
+
+      - name: Show events if something failed
+        if: failure()
+        run: kubectl -n "$NS" get events --sort-by=.lastTimestamp || true
